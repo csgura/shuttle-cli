@@ -170,6 +170,7 @@ func main() {
 		pmap := map[int][]Host{
 			0: list,
 		}
+		gname := ""
 		for {
 
 			grouped := slice.GroupBy(pmap[level], func(a Host) string {
@@ -183,12 +184,26 @@ func main() {
 			delete(grouped, "")
 			slist := slice.Sort(slice.FromMapKeys(grouped), ord.Given[string]())
 
-			log("Hosts:")
-			for i := 0; i < len(leafs); i++ {
-				log("  %d: %s", i, leafs[i].Name)
+			if len(leafs) > 0 {
+				log("")
+				if level > 0 {
+					log("Hosts in %s:", gname)
+				} else {
+					log("Hosts:")
+
+				}
+				for i := 0; i < len(leafs); i++ {
+					if leafs[i].Alias != "" {
+						log("  %d: %s (%s)", i, leafs[i].Name, leafs[i].Alias)
+
+					} else {
+						log("  %d: %s", i, leafs[i].Name)
+					}
+				}
 			}
 
 			if len(slist) > 0 {
+				log("")
 				log("Groups:")
 				for i := 0; i < len(slist); i++ {
 					log("  %d: %s", i+len(leafs), slist[i])
@@ -199,11 +214,13 @@ func main() {
 				log("  up: goto upper level")
 			}
 
+			log("")
 			fmt.Printf("enter number: ")
 			str, _ := reader.ReadString('\n')
 			str = strings.TrimSpace(str)
 			if str == "up" {
 				level = level - 1
+				gname = slice.MakeString(slice.Init(strings.Split(gname, "/")), "/")
 				continue
 			}
 			n, err := fp.ParseInt(str).Unapply()
@@ -215,6 +232,7 @@ func main() {
 
 				n = n - len(leafs)
 				if n < len(slist) {
+					gname = gname + "/" + slist[n]
 					level = level + 1
 					pmap[level] = grouped[slist[n]]
 				}
