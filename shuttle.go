@@ -211,6 +211,7 @@ func main() {
 			}
 
 			if level > 0 {
+				log("")
 				log("  up: goto upper level")
 			}
 
