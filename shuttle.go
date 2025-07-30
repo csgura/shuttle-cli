@@ -13,6 +13,7 @@ import (
 	"github.com/csgura/fp/option"
 	"github.com/csgura/fp/ord"
 	"github.com/csgura/fp/slice"
+	"mvdan.cc/sh/v3/syntax"
 )
 
 func log(fmtstr string, args ...any) {
@@ -20,11 +21,21 @@ func log(fmtstr string, args ...any) {
 }
 
 type Host struct {
-	Parent []string
-	Name   string
-	Alias  string
-	Cmd    string
-	Theme  string
+	Parent   []string
+	Name     string
+	Alias    string
+	Cmd      string
+	Theme    string
+	User     string
+	HostName string
+	Pass     string
+}
+
+func (r Host) Login() fp.Option[string] {
+	if r.User != "" && r.HostName != "" {
+		return option.Some(r.User + "@" + r.HostName)
+	}
+	return option.NonZero(r.HostName)
 }
 
 func get(v map[string]any, k string) fp.Option[string] {
@@ -36,18 +47,104 @@ func get(v map[string]any, k string) fp.Option[string] {
 	return option.None[string]()
 }
 
+type LoginInfo struct {
+	User     string
+	HostName string
+	Pass     string
+}
+
+func partToString(v syntax.WordPart) string {
+	switch x := v.(type) {
+	case *syntax.Lit:
+		return x.Value
+	case *syntax.SglQuoted:
+		if x.Dollar {
+			return fmt.Sprintf("$'%s'", x.Value)
+		}
+		return x.Value
+	case *syntax.DblQuoted:
+		s := slice.MakeString(slice.Map(x.Parts, partToString), "")
+		if x.Dollar {
+			return fmt.Sprintf(`$"%s"`, s)
+		}
+		return s
+	}
+	sb := &strings.Builder{}
+	syntax.NewPrinter().Print(sb, v)
+	return sb.String()
+}
+func wordToString(v *syntax.Word) string {
+	if s := v.Lit(); s != "" {
+		return s
+	}
+
+	return slice.MakeString(slice.Map(v.Parts, partToString), "")
+}
+
+func parseCmd(cmd string) fp.Option[LoginInfo] {
+
+	none := option.None[LoginInfo]()
+	if cmd == "" {
+		return none
+	}
+	p := syntax.NewParser()
+
+	s, err := p.Parse(strings.NewReader(cmd), "cmd")
+	if err == nil {
+		ret := LoginInfo{}
+		syntax.Walk(s, func(n syntax.Node) bool {
+			switch x := n.(type) {
+			case *syntax.CallExpr:
+				if x.Args[0].Lit() == "sshpass" {
+					pass := slice.Find(x.Assigns, func(v *syntax.Assign) bool {
+						return v.Name != nil && v.Name.Value == "SSHPASS" && v.Value != nil
+					})
+					for pv := range pass.All() {
+						ret.Pass = wordToString(pv.Value)
+					}
+
+					_, sshcmd := slice.Span(x.Args[1:], func(t *syntax.Word) bool {
+						return t.Lit() != "ssh"
+					})
+					_, target := slice.Span(slice.Tail(sshcmd), func(t *syntax.Word) bool {
+						return strings.HasPrefix(t.Lit(), "-")
+					})
+					for host := range slice.Head(target).All() {
+						arr := strings.Split(host.Lit(), "@")
+						user := slice.Head(slice.Init(arr))
+						hostname := slice.Last(arr)
+						ret.User = user.OrZero()
+						ret.HostName = hostname.OrZero()
+					}
+				}
+				return false
+			}
+			return true
+		})
+		if ret.HostName != "" {
+			return option.Some(ret)
+		}
+	}
+	return none
+}
+
 func getList(group []string, v any) []Host {
 	switch t := v.(type) {
 	case nil:
 		return nil
 	case map[string]any:
 		if t["name"] != nil {
+			cmd := get(t, "cmd").OrZero()
+			login := parseCmd(cmd).OrZero()
 			return slice.Of(Host{
-				Parent: group,
-				Name:   get(t, "name").OrZero(),
-				Cmd:    get(t, "cmd").OrZero(),
-				Alias:  get(t, "alias").OrZero(),
-				Theme:  get(t, "theme").OrZero(),
+				Parent:   group,
+				Name:     get(t, "name").OrZero(),
+				Cmd:      cmd,
+				Alias:    get(t, "alias").OrZero(),
+				Theme:    get(t, "theme").OrZero(),
+				User:     login.User,
+				HostName: login.HostName,
+				Pass:     login.Pass,
 			})
 		} else {
 			return slice.FlatMap(slice.FromMap(t), func(v fp.Entry[any]) fp.Slice[Host] {
@@ -76,6 +173,18 @@ func getComment(lines []string, k string) fp.Option[string] {
 	return option.None[string]()
 }
 
+func getValue(lines []string, k string) fp.Option[string] {
+
+	cfgline := slice.Find(lines, fp.Test(strings.Contains, k))
+	if cfgline.IsDefined() {
+		tarr := strings.Fields(cfgline.Get())
+		for t := range slice.Last(tarr).All() {
+			return option.Some(strings.TrimSpace(t))
+		}
+	}
+
+	return option.None[string]()
+}
 func sshConfigToHost(lines []string) fp.Option[Host] {
 	none := option.None[Host]()
 	if len(lines) > 0 {
@@ -84,10 +193,13 @@ func sshConfigToHost(lines []string) fp.Option[Host] {
 		if slice.Get(f, 0) == option.Some("Host") {
 			for host := range slice.Get(f, 1).All() {
 				ret := Host{
-					Name:   host,
-					Cmd:    "ssh " + host,
-					Theme:  getComment(lines, "shuttle.theme").OrZero(),
-					Alias:  getComment(lines, "shuttle.alias").OrZero(),
+					Name:     host,
+					Cmd:      "ssh " + host,
+					Theme:    getComment(lines, "shuttle.theme").OrZero(),
+					Alias:    getComment(lines, "shuttle.alias").OrZero(),
+					User:     getValue(lines, "User").OrZero(),
+					HostName: getValue(lines, "HostName").OrZero(),
+
 					Parent: slice.Init(strings.Split(getComment(lines, "shuttle.name").OrZero(), "/")),
 				}
 				return option.Some(ret)
@@ -121,6 +233,12 @@ func connect(c Host) {
 	if err != nil {
 		log("exec error : %s", err)
 		os.Exit(1)
+	}
+}
+
+func prepend(p string) func(string) string {
+	return func(s string) string {
+		return p + s
 	}
 }
 func main() {
@@ -194,10 +312,10 @@ func main() {
 				}
 				for i := 0; i < len(leafs); i++ {
 					if leafs[i].Alias != "" {
-						log("  %d: %s (%s)", i, leafs[i].Name, leafs[i].Alias)
+						log("  %d: %s (%s) %s", i, leafs[i].Name, leafs[i].Alias, leafs[i].Login().Map(prepend("- ")).OrZero())
 
 					} else {
-						log("  %d: %s", i, leafs[i].Name)
+						log("  %d: %s %s", i, leafs[i].Name, leafs[i].Login().Map(prepend("- ")).OrZero())
 					}
 				}
 			}
@@ -224,18 +342,32 @@ func main() {
 				gname = slice.MakeString(slice.Init(strings.Split(gname, "/")), "/")
 				continue
 			}
+			pass := false
+			if strings.HasPrefix(str, "p") {
+				pass = true
+				str = str[1:]
+			}
 			n, err := fp.ParseInt(str).Unapply()
 			if err == nil {
-				if n < len(leafs) {
-					connect(leafs[n])
-					os.Exit(0)
-				}
+				if pass {
+					if n < len(leafs) {
+						log("")
+						log("%s", leafs[n].Pass)
+					}
 
-				n = n - len(leafs)
-				if n < len(slist) {
-					gname = gname + "/" + slist[n]
-					level = level + 1
-					pmap[level] = grouped[slist[n]]
+				} else {
+
+					if n < len(leafs) {
+						connect(leafs[n])
+						os.Exit(0)
+					} else {
+						n = n - len(leafs)
+						if n < len(slist) {
+							gname = gname + "/" + slist[n]
+							level = level + 1
+							pmap[level] = grouped[slist[n]]
+						}
+					}
 				}
 			}
 		}
